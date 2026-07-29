@@ -1,7 +1,7 @@
 import warnings
 import pandas as pd
 from datetime import datetime, timedelta, date
-from .core.scrapers import ScraperInput
+from .core.scrapers import ScraperInput, SearchResult, SearchMetadata, query_needs_split
 from .utils import (
     process_result, ordered_properties, validate_input, validate_dates, validate_limit,
     validate_offset, validate_datetime, validate_filters, validate_sort, validate_last_update_filters,
@@ -23,7 +23,7 @@ def scrape_property(
     date_from: datetime | date | str = None,
     date_to: datetime | date | str = None,
     foreclosure: bool = None,
-    extra_property_data: bool = True,
+    extra_property_data: bool = False,
     exclude_pending: bool = False,
     limit: int = 10000,
     offset: int = 0,
@@ -50,7 +50,9 @@ def scrape_property(
     sort_direction: str = "desc",
     # Pagination control
     parallel: bool = True,
-) -> Union[pd.DataFrame, list[dict], list[Property]]:
+    # Metadata / completeness opt-in
+    return_metadata: bool = False,
+) -> Union[pd.DataFrame, list[dict], list[Property], "SearchResult"]:
     """
     Scrape properties from Realtor.com based on a given location and listing type.
 
@@ -77,7 +79,11 @@ def scrape_property(
         Timezone handling: Naive datetimes are treated as local time and automatically converted to UTC.
         Timezone-aware datetimes are converted to UTC. For best results, use timezone-aware datetimes.
     :param foreclosure: If set, fetches only foreclosure listings.
-    :param extra_property_data: Increases requests by O(n). If set, this fetches additional property data (e.g. agent, broker, property evaluations etc.)
+    :param extra_property_data: Increases requests by O(n). When True, fetches additional
+        property data (e.g. agent, broker, property evaluations) via per-page bulk detail
+        requests during general searches. Defaults to False (no extra detail requests).
+        Older public docs listed True as the default, but the implementation now keeps extra
+        detail off unless callers opt in explicitly (e.g. RET passes extra_property_data=True).
     :param exclude_pending: If true, this excludes pending or contingent properties from the results, unless listing type is pending.
     :param limit: Limit the number of results returned. Maximum is 10,000.
     :param offset: Starting position for pagination within the 10k limit (offset + limit cannot exceed 10,000). Use with limit to fetch results in chunks (e.g., offset=200, limit=200 fetches results 200-399). Should be a multiple of 200 (page size) for optimal performance. Default is 0. Note: Cannot be used to bypass the 10k API limit - use date ranges (date_from/date_to) to narrow searches and fetch more data.
@@ -101,6 +107,10 @@ def scrape_property(
     :param parallel: Controls pagination strategy. True (default) = fetch all pages in parallel for maximum speed.
         False = fetch pages sequentially with early termination checks (useful for rate limiting or narrow time windows).
         Sequential mode will stop paginating as soon as time-based filters indicate no more matches are possible.
+    :param return_metadata: If True, returns a `SearchResult` wrapper containing the normal result plus
+        a `SearchMetadata` object describing source-reported total, raw rows received, attempted/completed
+        page offsets, whether the 10,000 upstream boundary was reached, and whether completeness is proven.
+        The 10,000 result ceiling is an upstream Realtor.com limit; this option only exposes the signal.
 
     Note: past_days and past_hours also accept timedelta objects for more Pythonic usage.
     """
@@ -197,14 +207,27 @@ def scrape_property(
         sort_direction=sort_direction,
         # Pagination control
         parallel=parallel,
+        # Metadata / completeness opt-in
+        return_metadata=return_metadata,
     )
 
     site = RealtorScraper(scraper_input)
     results = site.search()
 
+    if scraper_input.return_metadata:
+        # results is a SearchResult; for pandas, convert the attached properties list
+        if scraper_input.return_type == ReturnType.pandas:
+            results.properties = _properties_to_dataframe(results.properties)
+        return results
+
     if scraper_input.return_type != ReturnType.pandas:
         return results
 
+    return _properties_to_dataframe(results)
+
+
+def _properties_to_dataframe(results):
+    """Convert a list of Property/dict results into the ordered HomeHarvest DataFrame."""
     properties_dfs = [df for result in results if not (df := process_result(result)).empty]
     if not properties_dfs:
         return pd.DataFrame()

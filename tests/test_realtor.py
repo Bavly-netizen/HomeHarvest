@@ -1,7 +1,9 @@
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from unittest.mock import patch
+from contextlib import contextmanager
 
-from homeharvest import scrape_property, Property
+from homeharvest import scrape_property, Property, SearchResult, query_needs_split
 import pandas as pd
 
 
@@ -1638,3 +1640,1067 @@ def test_timezone_handling_date_range():
         now_utc = now.astimezone(tz=pytz.timezone("UTC"))
         assert (properties["pending_date"] <= now_utc).all()
 
+
+# --- Mock helpers for deterministic metadata/completeness tests ---
+# These tests do not touch the network; they patch location resolution and
+# GraphQL responses so the scraper runs against controlled data.
+
+
+def _mock_location(area_type="city"):
+    return {
+        "area_type": area_type,
+        "text": "Mock City, CA",
+        "city": "Mock City",
+        "state_code": "CA",
+        "postal_code": "90210",
+        "county": "Mock County",
+        "centroid": {"lon": -120.0, "lat": 36.0},
+    }
+
+
+def _mock_property(idx):
+    return {
+        "property_id": f"P{idx}",
+        "listing_id": f"L{idx}",
+        "permalink": f"/property/P{idx}",
+        "href": f"https://www.realtor.com/property/P{idx}",
+        "source": {"id": "STMLS", "listing_id": f"L{idx}"},
+        "status": "for_sale",
+        "list_price": 500000 + idx,
+        "list_price_min": None,
+        "list_price_max": None,
+        "list_date": "2025-01-01T12:00:00",
+        "flags": {"is_pending": False, "is_contingent": False, "is_new_construction": False},
+        "location": {
+            "address": {
+                "line": f"{idx} Main St",
+                "unit": None,
+                "city": "Mock City",
+                "state_code": "CA",
+                "postal_code": "90210",
+                "coordinate": {"lat": 36.0, "lon": -120.0},
+            },
+            "county": {"name": "Mock County", "fips_code": "06000"},
+            "parcel": None,
+        },
+        "description": {
+            "beds": 3,
+            "baths_full": 2,
+            "baths_half": 0,
+            "sqft": 1500,
+            "lot_sqft": 5000,
+            "year_built": 2000,
+            "stories": 1,
+            "garage": 1,
+            "text": "Nice house",
+            "type": "SINGLE_FAMILY",
+        },
+        "photos": [],
+        "open_houses": None,
+        "advertisers": [],
+        "tags": [],
+        "details": [],
+    }
+
+
+def _make_home_search_response(results, total):
+    return {
+        "data": {
+            "homeSearch": {
+                "results": results,
+                "total": total,
+            }
+        }
+    }
+
+
+def _graphql_search_side_effect(total, results_per_page=200):
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            page_count = max(0, min(results_per_page, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def _graphql_search_with_failure(total, failed_offset):
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            if offset == failed_offset:
+                return {"data": {"homeSearch": None}}
+            page_count = max(0, min(200, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+@contextmanager
+def _mock_realtor_search(total, results_per_page=200, side_effect=None):
+    side_effect = side_effect or _graphql_search_side_effect(total, results_per_page)
+    with patch(
+        "homeharvest.core.scrapers.realtor.RealtorScraper.handle_location",
+        return_value=_mock_location(),
+    ):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper._graphql_post",
+            side_effect=side_effect,
+        ):
+            yield
+
+
+# --- Deterministic metadata / completeness tests ---
+
+
+def test_metadata_backwards_compatibility():
+    """Default scrape_property callers receive the same pandas DataFrame as before."""
+    with _mock_realtor_search(total=5):
+        result = scrape_property("Mock City, CA", listing_type="for_sale", limit=5)
+
+    assert isinstance(result, pd.DataFrame)
+    assert len(result) == 5
+    assert "property_id" in result.columns
+
+
+def test_metadata_total_propagation():
+    """The source-reported total is surfaced in SearchMetadata."""
+    with _mock_realtor_search(total=5):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=10,
+            return_metadata=True,
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.metadata.source_reported_total == 5
+    assert result.metadata.requested_limit == 10
+    assert result.metadata.requested_offset == 0
+    assert result.metadata.raw_rows_received == 5
+    assert result.metadata.window_rows_received == 5
+    assert result.metadata.processed_rows_received == 5
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 5
+    assert result.metadata.completeness_proven is True
+    assert result.metadata.truncated_by_10k is False
+
+
+def test_metadata_exact_10k_truncation():
+    """A result window that returns exactly 10,000 rows is not marked complete."""
+    with _mock_realtor_search(total=10_000, results_per_page=200):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=10_000,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.metadata.source_reported_total == 10_000
+    assert result.metadata.raw_rows_received == 10_000
+    assert result.metadata.window_rows_received == 10_000
+    assert result.metadata.processed_rows_received == 10_000
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.reached_10k_boundary is True
+    assert result.metadata.truncated_by_10k is True
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.is_complete is False
+
+
+def test_metadata_reported_total_over_limit():
+    """A reported total above the 10k ceiling is a truncation signal even for a small window."""
+    with _mock_realtor_search(total=12_000):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=500,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.metadata.source_reported_total == 12_000
+    # The API returns 200-row pages; the scraper fetches 0,200,400 and then slices to the 500 limit.
+    assert result.metadata.raw_rows_received == 600
+    assert result.metadata.window_rows_received == 500
+    assert result.metadata.processed_rows_received == 500
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 500
+    assert result.metadata.truncated_by_10k is True
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_partial_page_failure():
+    """A failing page offset is captured and prevents a false completeness claim."""
+    side_effect = _graphql_search_with_failure(total=600, failed_offset=200)
+    with _mock_realtor_search(total=600, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=600,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert 0 in result.metadata.page_offsets_completed
+    assert 200 in result.metadata.page_offsets_failed
+    assert 400 in result.metadata.page_offsets_completed
+    # Pages 0 and 400 succeed; page 200 returns an empty/invalid response.
+    assert result.metadata.raw_rows_received == 400
+    assert result.metadata.window_rows_received == 400
+    assert result.metadata.returned_rows == 400
+    assert result.metadata.has_errors is True
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.is_complete is False
+
+
+def test_metadata_extra_property_data_enabled():
+    """extra_property_data=True is honored and triggers the bulk details call."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            return_value={},
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+            )
+
+    assert isinstance(result, SearchResult)
+    assert mock_bulk.called is True
+    assert result.metadata.raw_rows_received == 5
+    assert result.metadata.enrichment_requested is True
+    assert result.metadata.enrichment_requested_ids == 5
+    assert result.metadata.enrichment_received_ids == 0
+    assert result.metadata.enrichment_missing_ids == 5
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+
+
+def test_query_needs_split_helper():
+    """The pure helper used by RET to decide whether to shard a query."""
+    assert query_needs_split(0, 100, 500, 100) is False
+    assert query_needs_split(0, 10_000, 10_000, 10_000) is True
+    assert query_needs_split(0, 500, 12_000, 500) is True
+    assert query_needs_split(9_900, 200, 20_000, 200) is True
+    # Total == 10k is itself a cap signal; the API may have more beyond the boundary.
+    assert query_needs_split(9_900, 200, 10_000, 100) is True
+    # 9_900 total with offset 9_900 and limit 200: we are at the end, no more rows possible.
+    assert query_needs_split(9_900, 200, 9_900, 100) is False
+    assert query_needs_split(0, 100, 500, 100, [200]) is True
+    # The helper treats any raw row count at or above the ceiling as a cap signal.
+    assert query_needs_split(0, 100, 500, 10_001) is True
+
+
+def _graphql_search_raises_exception(total, failed_offset):
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            if offset == failed_offset:
+                raise RuntimeError("Simulated page failure")
+            page_count = max(0, min(200, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def test_metadata_offset_non_zero():
+    """offset>0 is a window start, not an absolute end index."""
+    with _mock_realtor_search(total=500):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            offset=200,
+            limit=200,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 200
+    assert result.metadata.requested_offset == 200
+    assert result.metadata.requested_limit == 200
+    assert result.metadata.raw_rows_received == 200
+    assert result.metadata.window_rows_received == 200
+    assert result.metadata.processed_rows_received == 200
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 200
+    assert result.metadata.completeness_proven is True
+    assert result.metadata.page_offsets_attempted == [200]
+
+
+def test_metadata_non_multiple_final_page():
+    """A limit that does not end on a page boundary is sliced correctly."""
+    with _mock_realtor_search(total=600):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=350,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 350
+    assert result.metadata.raw_rows_received == 400
+    assert result.metadata.window_rows_received == 350
+    assert result.metadata.processed_rows_received == 350
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 350
+    assert result.metadata.completeness_proven is True
+    assert result.metadata.page_offsets_attempted == [0, 200]
+
+
+def test_metadata_completeness_from_window_not_raw_total():
+    """A 500-row window that receives 600 raw rows is not marked incomplete."""
+    with _mock_realtor_search(total=600):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=500,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 500
+    assert result.metadata.source_reported_total == 600
+    assert result.metadata.raw_rows_received == 600
+    assert result.metadata.window_rows_received == 500
+    assert result.metadata.processed_rows_received == 500
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 500
+    assert result.metadata.completeness_proven is True
+    assert result.metadata.is_complete is True
+    assert result.metadata.full_result_set_completeness_proven is False
+    assert result.metadata.is_full_result_set_complete is False
+
+
+def test_metadata_exception_page_failure():
+    """An exception from a later page is captured as failed metadata, not aborting."""
+    side_effect = _graphql_search_raises_exception(total=600, failed_offset=200)
+    with _mock_realtor_search(total=600, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=600,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert 0 in result.metadata.page_offsets_completed
+    assert 200 in result.metadata.page_offsets_failed
+    assert 400 in result.metadata.page_offsets_completed
+    assert result.metadata.has_errors is True
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.is_complete is False
+    assert any("RuntimeError" in err for err in result.metadata.errors)
+
+
+def test_metadata_extra_property_data_default_omitted():
+    """Omitting extra_property_data retains the prior no-extra-request behavior."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            return_value={},
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                return_metadata=True,
+            )
+
+    assert isinstance(result, SearchResult)
+    assert mock_bulk.called is False
+    assert result.metadata.raw_rows_received == 5
+    assert result.metadata.enrichment_requested is False
+    assert result.metadata.enrichment_requested_ids == 0
+    assert result.metadata.enrichment_received_ids == 0
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_unaddressable_rows == 0
+    assert result.metadata.enrichment_completeness_proven is True
+    assert result.metadata.enrichment_errors == []
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is True
+
+
+def test_metadata_offset_non_multiple_page_boundary():
+    """A window starting at a non-page-multiple offset is sliced correctly."""
+    with _mock_realtor_search(total=600):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            offset=250,
+            limit=100,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 100
+    assert result.metadata.requested_offset == 250
+    assert result.metadata.requested_limit == 100
+    assert result.metadata.raw_rows_received == 200
+    assert result.metadata.window_rows_received == 100
+    assert result.metadata.processed_rows_received == 100
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 100
+    assert result.metadata.completeness_proven is True
+    assert result.metadata.page_offsets_attempted == [250]
+
+
+def _graphql_search_with_inconsistent_totals():
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            total = 500 if offset == 0 else 600
+            page_count = max(0, min(200, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def test_metadata_inconsistent_page_totals():
+    """Inconsistent source totals across pages must be surfaced and prevent completeness."""
+    side_effect = _graphql_search_with_inconsistent_totals()
+    with _mock_realtor_search(total=600, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=600,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.metadata.source_reported_total == 500
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.has_errors is True
+    assert any("inconsistent source total" in err for err in result.metadata.errors)
+    assert any("600" in err and "500" in err for err in result.metadata.errors)
+
+
+def _graphql_search_raises_with_sensitive_message(total, failed_offset):
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            if offset == failed_offset:
+                raise RuntimeError(
+                    "proxy http://secret:credential@proxy.example.com leaked"
+                )
+            page_count = max(0, min(200, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def test_metadata_sanitized_exception_metadata():
+    """Exception metadata must not echo arbitrary text that may contain secrets."""
+    side_effect = _graphql_search_raises_with_sensitive_message(total=600, failed_offset=200)
+    with _mock_realtor_search(total=600, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=600,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert 200 in result.metadata.page_offsets_failed
+    assert any("RuntimeError" in err for err in result.metadata.errors)
+    assert all("secret" not in err for err in result.metadata.errors)
+    assert all("credential" not in err for err in result.metadata.errors)
+    assert all("proxy" not in err for err in result.metadata.errors)
+    assert all("leaked" not in err for err in result.metadata.errors)
+    assert all("http://" not in err for err in result.metadata.errors)
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_processor_rejection_accounting():
+    """Window rows that fail HomeHarvest processing are counted separately from client filters."""
+    def _rejecting_process_property(result, *args, **kwargs):
+        # Reject every other property to make the accounting deterministic.
+        if int(result.get("property_id", "P0")[1:]) % 2 == 0:
+            return None
+        return result
+
+    with _mock_realtor_search(total=10):
+        with patch(
+            "homeharvest.core.scrapers.realtor.process_property",
+            side_effect=_rejecting_process_property,
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=10,
+                return_metadata=True,
+                return_type="pydantic",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert result.metadata.window_rows_received == 10
+    assert result.metadata.processed_rows_received == 5
+    assert result.metadata.processor_rejected_rows == 5
+    assert result.metadata.returned_rows == 5
+    # RET must not treat a lossy processed result as complete.
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.is_complete is False
+
+
+def _graphql_search_with_overfetch(total, page_size=200):
+    """Simulate final-page transport overfetch (e.g. 9,900 window -> 10,000 raw rows)."""
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            last_page_offset = (total // page_size) * page_size
+            if offset == last_page_offset:
+                page_count = page_size
+            else:
+                page_count = max(0, min(page_size, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def _graphql_search_with_graphql_error(total, error_offset):
+    """Return a GraphQL error response containing arbitrary text at one offset."""
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            if offset == error_offset:
+                return {
+                    "errors": [
+                        {"message": "proxy http://secret:credential@proxy.example.com leaked"},
+                        {"message": "internal server error"},
+                    ]
+                }
+            page_count = max(0, min(200, total - offset))
+            results = [_mock_property(offset + i) for i in range(page_count)]
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+# --- Mandatory final cap-contract regressions ---
+
+
+def test_metadata_9900_window_with_transport_overfetch():
+    """A 9,900-row window receiving 10,000 transport rows is complete, not capped."""
+    side_effect = _graphql_search_with_overfetch(total=9_900)
+    with _mock_realtor_search(total=9_900, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=9_900,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 9_900
+    assert result.metadata.source_reported_total == 9_900
+    assert result.metadata.raw_rows_received == 10_000
+    assert result.metadata.window_rows_received == 9_900
+    assert result.metadata.processed_rows_received == 9_900
+    assert result.metadata.processor_rejected_rows == 0
+    assert result.metadata.returned_rows == 9_900
+    assert result.metadata.reached_10k_boundary is False
+    assert result.metadata.truncated_by_10k is False
+    assert result.metadata.completeness_proven is True
+    assert result.metadata.is_complete is True
+
+
+def test_metadata_10k_window_cap():
+    """A true 10,000-row window is treated as capped, even with no overfetch."""
+    with _mock_realtor_search(total=10_000):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=10_000,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.metadata.source_reported_total == 10_000
+    assert result.metadata.window_rows_received == 10_000
+    assert result.metadata.reached_10k_boundary is True
+    assert result.metadata.truncated_by_10k is True
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.is_complete is False
+
+
+def test_metadata_sanitized_graphql_error():
+    """GraphQL/server error text is replaced with a fixed safe message in metadata."""
+    side_effect = _graphql_search_with_graphql_error(total=600, error_offset=200)
+    with _mock_realtor_search(total=600, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=600,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert 200 in result.metadata.page_offsets_failed
+    assert result.metadata.has_errors is True
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.is_complete is False
+    # No arbitrary GraphQL/server text should leak through.
+    assert all("secret" not in err for err in result.metadata.errors)
+    assert all("credential" not in err for err in result.metadata.errors)
+    assert all("proxy" not in err for err in result.metadata.errors)
+    assert all("leaked" not in err for err in result.metadata.errors)
+    assert all("internal server error" not in err for err in result.metadata.errors)
+    assert any("GraphQL error" in err for err in result.metadata.errors)
+
+
+def test_query_needs_split_prefers_window_rows():
+    """query_needs_split uses window_rows_received when supplied; otherwise falls back to raw."""
+    # With the correct window row count, a 9,900-window/10,000-transport case is not capped.
+    assert query_needs_split(0, 9_900, 9_900, 10_000, window_rows_received=9_900) is False
+    # A true 10,000-window cap is still detected through window_rows.
+    assert query_needs_split(0, 10_000, 10_000, 10_000, window_rows_received=10_000) is True
+    # Without the window count, the legacy conservative behavior uses raw rows.
+    assert query_needs_split(0, 9_900, 9_900, 10_000) is True
+    # Failed pages still force a split regardless of row counts.
+    assert query_needs_split(0, 9_900, 9_900, 9_900, page_offsets_failed=[200], window_rows_received=9_900) is True
+
+
+def _mock_bulk_details_for_ids(property_ids):
+    """Return a minimal bulk-details map for the requested property IDs."""
+    return {
+        property_id: {
+            "property_id": property_id,
+            "location": {"address": {"line": "1 Main St"}},
+            "tax_history": [{"year": 2024}],
+        }
+        for property_id in property_ids
+    }
+
+
+def test_metadata_enrichment_full_success():
+    """All requested enrichment IDs are received and overall completeness holds."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert result.metadata.enrichment_requested is True
+    assert result.metadata.enrichment_requested_ids == 5
+    assert result.metadata.enrichment_received_ids == 5
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_completeness_proven is True
+    assert result.metadata.enrichment_errors == []
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is True
+
+
+def test_metadata_enrichment_partial_response():
+    """A partial bulk-details response is visible and fails enrichment completeness."""
+    def _partial_bulk(property_ids):
+        return _mock_bulk_details_for_ids(property_ids[:2])
+
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=_partial_bulk,
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert result.metadata.enrichment_requested_ids == 5
+    assert result.metadata.enrichment_received_ids == 2
+    assert result.metadata.enrichment_missing_ids == 3
+    assert result.metadata.enrichment_completeness_proven is False
+    assert "enrichment: partial details response" in result.metadata.enrichment_errors
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_enrichment_empty_response():
+    """An empty bulk-details response is visible and does not count as success."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            return_value={},
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert result.metadata.enrichment_requested_ids == 5
+    assert result.metadata.enrichment_received_ids == 0
+    assert result.metadata.enrichment_missing_ids == 5
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.enrichment_errors == ["enrichment: empty details response"]
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_enrichment_exception_preserves_base_rows():
+    """Enrichment exceptions after retries preserve base rows with safe errors."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=RuntimeError(
+                "proxy http://secret:credential@proxy.example.com leaked"
+            ),
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert result.metadata.enrichment_requested_ids == 5
+    assert result.metadata.enrichment_received_ids == 0
+    assert result.metadata.enrichment_missing_ids == 5
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.enrichment_errors == ["enrichment: bulk details request failed"]
+    assert all("secret" not in err for err in result.metadata.enrichment_errors)
+    assert all("credential" not in err for err in result.metadata.enrichment_errors)
+    assert all("proxy" not in err for err in result.metadata.enrichment_errors)
+    assert all("http://" not in err for err in result.metadata.enrichment_errors)
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_enrichment_not_requested_not_applicable():
+    """When enrichment is not requested, enrichment completeness is not-applicable."""
+    with _mock_realtor_search(total=5):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=5,
+            extra_property_data=False,
+            return_metadata=True,
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.metadata.enrichment_requested is False
+    assert result.metadata.enrichment_requested_ids == 0
+    assert result.metadata.enrichment_received_ids == 0
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_unaddressable_rows == 0
+    assert result.metadata.enrichment_completeness_proven is True
+    assert result.metadata.enrichment_errors == []
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is True
+
+
+def test_metadata_base_complete_while_overall_incomplete_on_enrichment_loss():
+    """Base listing completeness can hold even when enrichment fails."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            return_value={},
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+            )
+
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_full_result_false_on_enrichment_loss():
+    """Full snapshot completeness is false when enrichment is incomplete."""
+    with _mock_realtor_search(total=5):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            return_value={},
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+            )
+
+    assert result.metadata.full_base_result_set_completeness_proven is True
+    assert result.metadata.full_result_set_completeness_proven is False
+
+
+def test_metadata_enrichment_aggregation_across_pages():
+    """Enrichment counts aggregate deterministically across paginated pages."""
+    def _bulk_every_other(property_ids):
+        return _mock_bulk_details_for_ids(property_ids[::2])
+
+    with _mock_realtor_search(total=400):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=_bulk_every_other,
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=400,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 400
+    assert result.metadata.enrichment_requested_ids == 400
+    assert result.metadata.enrichment_received_ids == 200
+    assert result.metadata.enrichment_missing_ids == 200
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.enrichment_errors == ["enrichment: partial details response"]
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+
+
+def _graphql_search_with_missing_property_id(total, missing_at_index=4):
+    """Return search results where one row lacks a property_id."""
+
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            page_count = max(0, min(200, total - offset))
+            results = []
+            for i in range(page_count):
+                row = _mock_property(offset + i)
+                if offset + i == missing_at_index:
+                    del row["property_id"]
+                results.append(row)
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def _graphql_search_with_duplicate_property_ids(total):
+    """Return search results where one row repeats an earlier property_id."""
+
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            page_count = max(0, min(200, total - offset))
+            results = []
+            for i in range(page_count):
+                row = _mock_property(offset + i)
+                if offset + i == 1:
+                    row["property_id"] = "P0"
+                results.append(row)
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def _graphql_search_with_unaddressable_across_pages(total, unaddressable_offsets):
+    """Return one unaddressable row per listed page offset."""
+
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "GetHomeSearch":
+            offset = variables.get("offset", 0)
+            page_count = max(0, min(200, total - offset))
+            results = []
+            for i in range(page_count):
+                row = _mock_property(offset + i)
+                if offset in unaddressable_offsets and i == 0:
+                    row["property_id"] = ""
+                results.append(row)
+            return _make_home_search_response(results, total)
+        return {}
+
+    return _side_effect
+
+
+def test_metadata_enrichment_unaddressable_rows_fail_open():
+    """Five base rows with only four addressable IDs must not prove enrichment complete."""
+    side_effect = _graphql_search_with_missing_property_id(total=5, missing_at_index=4)
+    with _mock_realtor_search(total=5, side_effect=side_effect):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert mock_bulk.call_args.args[0] == ["P0", "P1", "P2", "P3"]
+    assert result.metadata.enrichment_requested_ids == 4
+    assert result.metadata.enrichment_received_ids == 4
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_unaddressable_rows == 1
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.enrichment_errors == ["enrichment: rows missing property id"]
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+    assert result.metadata.full_result_set_completeness_proven is False
+    assert all("P" not in err for err in result.metadata.enrichment_errors)
+
+
+def test_metadata_enrichment_duplicate_ids_without_false_failure():
+    """Duplicate valid property IDs are deduped for enrichment accounting."""
+    side_effect = _graphql_search_with_duplicate_property_ids(total=5)
+    with _mock_realtor_search(total=5, side_effect=side_effect):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=5,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert mock_bulk.call_args.args[0] == ["P0", "P2", "P3", "P4"]
+    assert result.metadata.enrichment_requested_ids == 4
+    assert result.metadata.enrichment_received_ids == 4
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_unaddressable_rows == 0
+    assert result.metadata.enrichment_completeness_proven is True
+    assert result.metadata.enrichment_errors == []
+    assert result.metadata.completeness_proven is True
+
+
+def test_metadata_enrichment_unaddressable_rows_aggregation_across_pages():
+    """Unaddressable row counts aggregate across paginated pages."""
+    side_effect = _graphql_search_with_unaddressable_across_pages(total=400, unaddressable_offsets=[0, 200])
+    with _mock_realtor_search(total=400, side_effect=side_effect):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ):
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=400,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 400
+    assert result.metadata.enrichment_unaddressable_rows == 2
+    assert result.metadata.enrichment_requested_ids == 398
+    assert result.metadata.enrichment_received_ids == 398
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.enrichment_errors == ["enrichment: rows missing property id"]
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+
+
+def test_metadata_enrichment_not_requested_zero_unaddressable_rows():
+    """When enrichment is not requested, unaddressable rows are not applicable and stay zero."""
+    side_effect = _graphql_search_with_missing_property_id(total=5, missing_at_index=4)
+    with _mock_realtor_search(total=5, side_effect=side_effect):
+        result = scrape_property(
+            "Mock City, CA",
+            listing_type="for_sale",
+            limit=5,
+            extra_property_data=False,
+            return_metadata=True,
+            return_type="raw",
+        )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 5
+    assert result.metadata.enrichment_requested is False
+    assert result.metadata.enrichment_unaddressable_rows == 0
+    assert result.metadata.enrichment_completeness_proven is True
+    assert result.metadata.enrichment_errors == []
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is True
+
+
+def test_metadata_search_pagination_uses_bounded_workers():
+    """Parallel pagination uses a bounded ThreadPoolExecutor worker count."""
+    with _mock_realtor_search(total=400):
+        with patch(
+            "homeharvest.core.scrapers.realtor.ThreadPoolExecutor",
+            wraps=ThreadPoolExecutor,
+        ) as mock_executor:
+            scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=400,
+                parallel=True,
+                return_metadata=True,
+            )
+
+    page_executor_calls = [
+        call for call in mock_executor.call_args_list
+        if call.kwargs.get("max_workers") == 8
+    ]
+    assert page_executor_calls, "Expected bounded pagination ThreadPoolExecutor(max_workers=8)"

@@ -1,12 +1,12 @@
 from __future__ import annotations
-from typing import Union
+from typing import Union, Any
 
 import requests
 import uuid
 from ...exceptions import AuthenticationError
 from .models import Property, ListingType, SiteName, SearchPropertyType, ReturnType
 import json
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 DEFAULT_HEADERS = {
@@ -43,7 +43,7 @@ class ScraperInput(BaseModel):
     date_from_precision: str | None = None  # "day" or "hour"
     date_to_precision: str | None = None    # "day" or "hour"
     foreclosure: bool | None = False
-    extra_property_data: bool | None = True
+    extra_property_data: bool = False
     exclude_pending: bool | None = False
     limit: int = 10000
     offset: int = 0
@@ -77,6 +77,110 @@ class ScraperInput(BaseModel):
     # Pagination control
     parallel: bool = True
 
+    # Metadata / completeness opt-in
+    return_metadata: bool = False
+
+
+class SearchMetadata(BaseModel):
+    """Structured metadata describing one requested search window.
+
+    ``completeness_proven`` is the overall requested-window contract: base search
+    complete and, when enrichment was requested, enrichment complete too.
+    ``base_completeness_proven`` isolates listing-set completeness from optional
+    extra-detail enrichment. RET callers that require a complete source snapshot
+    must use ``full_result_set_completeness_proven`` (overall) or
+    ``full_base_result_set_completeness_proven`` (base search only).
+    """
+
+    source: str = "realtor.com"
+    source_reported_total: int | None = None
+    requested_limit: int
+    requested_offset: int
+    raw_rows_received: int = 0
+    window_rows_received: int = 0
+    processed_rows_received: int = 0
+    processor_rejected_rows: int = 0
+    returned_rows: int = 0
+    page_offsets_attempted: list[int] = Field(default_factory=list)
+    page_offsets_completed: list[int] = Field(default_factory=list)
+    page_offsets_failed: list[int] = Field(default_factory=list)
+    reached_10k_boundary: bool = False
+    truncated_by_10k: bool = False
+    base_completeness_proven: bool = False
+    full_base_result_set_completeness_proven: bool = False
+    enrichment_requested: bool = False
+    enrichment_requested_ids: int = 0
+    enrichment_received_ids: int = 0
+    enrichment_missing_ids: int = 0
+    enrichment_unaddressable_rows: int = 0
+    enrichment_completeness_proven: bool = True
+    enrichment_errors: list[str] = Field(default_factory=list)
+    completeness_proven: bool = False
+    full_result_set_completeness_proven: bool = False
+    errors: list[str] = Field(default_factory=list)
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(self.errors) or bool(self.page_offsets_failed)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.completeness_proven and not self.has_errors
+
+    @property
+    def is_full_result_set_complete(self) -> bool:
+        return self.full_result_set_completeness_proven and not self.has_errors
+
+
+class SearchResult(BaseModel):
+    """Wrapper returned when the caller opts into metadata."""
+
+    # The actual shape depends on return_type: pandas DataFrame, list[Property],
+    # or list[dict]. Use Any so the public API can attach the converted result.
+    properties: Any = Field(default_factory=list)
+    metadata: SearchMetadata
+
+
+# Upstream Realtor.com ceiling. This is a hard platform limit; the library cannot
+# remove it. Callers should use date / price / ZIP sharding to subdivide queries
+# that hit this boundary.
+REALTOR_MAX_RESULTS = 10_000
+
+
+def query_needs_split(
+    offset: int,
+    limit: int,
+    source_reported_total: int | None,
+    raw_rows_received: int,
+    page_offsets_failed: list[int] | None = None,
+    window_rows_received: int | None = None,
+) -> bool:
+    """
+    Pure helper for RET to decide whether a query must be split/sharded.
+
+    Returns True when the requested window touches or exceeds the upstream
+    10,000 result ceiling and there are signs that more rows may exist, or when
+    any page failed (leaving the result incomplete). Recursive sharding by
+    ZIP, price, or date belongs in RET, not inside this generic library.
+
+    When ``window_rows_received`` is supplied it is used for cap detection so
+    final-page transport overfetch does not falsely trip the 10,000 boundary.
+    Without it, the legacy conservative behavior based on ``raw_rows_received``
+    is preserved for backwards compatibility.
+    """
+    if page_offsets_failed:
+        return True
+    rows_for_cap = window_rows_received if window_rows_received is not None else raw_rows_received
+    if rows_for_cap >= REALTOR_MAX_RESULTS:
+        return True
+    if source_reported_total is not None and source_reported_total >= REALTOR_MAX_RESULTS:
+        return True
+    if offset + limit >= REALTOR_MAX_RESULTS and (
+        source_reported_total is None or source_reported_total > offset + limit
+    ):
+        return True
+    return False
+
 
 class Scraper:
     def __init__(
@@ -89,7 +193,6 @@ class Scraper:
         self.proxy = scraper_input.proxy
         self.proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
 
-        self.listing_type = scraper_input.listing_type
         self.radius = scraper_input.radius
         self.last_x_days = scraper_input.last_x_days
         self.mls_only = scraper_input.mls_only
@@ -98,11 +201,12 @@ class Scraper:
         self.date_from_precision = scraper_input.date_from_precision
         self.date_to_precision = scraper_input.date_to_precision
         self.foreclosure = scraper_input.foreclosure
-        self.extra_property_data = False  # TODO: temporarily disabled
+        self.extra_property_data = scraper_input.extra_property_data
         self.exclude_pending = scraper_input.exclude_pending
         self.limit = scraper_input.limit
         self.offset = scraper_input.offset
         self.return_type = scraper_input.return_type
+        self.return_metadata = scraper_input.return_metadata
 
         # New date/time filtering
         self.past_hours = scraper_input.past_hours

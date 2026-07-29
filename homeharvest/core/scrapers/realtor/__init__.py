@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
 from typing import Dict, Union
 
@@ -21,7 +21,7 @@ from tenacity import (
     stop_after_attempt,
 )
 
-from .. import Scraper, DEFAULT_HEADERS
+from .. import Scraper, DEFAULT_HEADERS, REALTOR_MAX_RESULTS, SearchMetadata, SearchResult
 from ....exceptions import AuthenticationError
 from ..models import (
     Property,
@@ -39,6 +39,7 @@ from .processors import (
 class RealtorScraper(Scraper):
     SEARCH_GQL_URL = "https://www.realtor.com/frontdoor/graphql"
     NUM_PROPERTY_WORKERS = 20
+    SEARCH_PAGE_WORKERS = 8
     DEFAULT_PAGE_SIZE = 200
 
     def __init__(self, scraper_input):
@@ -488,6 +489,10 @@ class RealtorScraper(Scraper):
 
         properties: list[Union[Property, dict]] = []
 
+        page_offset = variables.get("offset", 0)
+        window_end = self.offset + self.limit
+        page_window_size = max(0, min(self.DEFAULT_PAGE_SIZE, window_end - page_offset))
+
         if (
             response_json is None
             or "data" not in response_json
@@ -496,22 +501,82 @@ class RealtorScraper(Scraper):
             or response_json["data"][search_key] is None
             or "results" not in response_json["data"][search_key]
         ):
-            return {"total": 0, "properties": []}
+            # Never echo arbitrary GraphQL/server error text into metadata; the
+            # caller gets a fixed, safe category so proxy URLs or credentials
+            # cannot leak back through SearchMetadata.errors.
+            return {
+                "total": 0,
+                "properties": [],
+                "raw_rows": 0,
+                "window_rows": 0,
+                "processed_rows": 0,
+                "processor_rejected_rows": 0,
+                "offset": page_offset,
+                "requested_limit": page_window_size,
+                "completed": False,
+                "error": "GraphQL error: page request failed",
+                "enrichment_requested_ids": 0,
+                "enrichment_received_ids": 0,
+                "enrichment_missing_ids": 0,
+                "enrichment_unaddressable_rows": 0,
+                "enrichment_errors": [],
+            }
 
         properties_list = response_json["data"][search_key]["results"]
         total_properties = response_json["data"][search_key]["total"]
-        offset = variables.get("offset", 0)
 
-        #: limit the number of properties to be processed
-        #: example, if your offset is 200, and your limit is 250, return 50
-        properties_list: list[dict] = properties_list[: self.limit - offset]
+        #: raw_rows: source rows received before client-side truncation / processing
+        raw_rows = len(properties_list)
+
+        #: Keep only the portion of the page that falls inside the requested window.
+        #: The API always returns a page starting at page_offset; we consume up to
+        #: the page size or the remaining window, whichever is smaller.
+        properties_list: list[dict] = properties_list[:page_window_size]
 
         if self.extra_property_data:
-            property_ids = [data["property_id"] for data in properties_list]
-            extra_property_details = self.get_bulk_prop_details(property_ids) or {}
+            property_ids: list[str] = []
+            seen_ids: set[str] = set()
+            enrichment_unaddressable_rows = 0
+            for data in properties_list:
+                property_id = data.get("property_id")
+                if property_id is None or (isinstance(property_id, str) and not property_id.strip()):
+                    enrichment_unaddressable_rows += 1
+                elif property_id not in seen_ids:
+                    seen_ids.add(property_id)
+                    property_ids.append(property_id)
+
+            enrichment_requested_ids = len(property_ids)
+            enrichment_received_ids = 0
+            enrichment_missing_ids = 0
+            enrichment_errors: list[str] = []
+            extra_property_details: dict = {}
+
+            if enrichment_unaddressable_rows > 0:
+                enrichment_errors.append("enrichment: rows missing property id")
+
+            try:
+                extra_property_details = self.get_bulk_prop_details(property_ids) or {}
+            except Exception:
+                enrichment_missing_ids = enrichment_requested_ids
+                enrichment_errors.append("enrichment: bulk details request failed")
+            else:
+                enrichment_received_ids = sum(
+                    1 for property_id in property_ids
+                    if extra_property_details.get(property_id)
+                )
+                enrichment_missing_ids = enrichment_requested_ids - enrichment_received_ids
+                if enrichment_requested_ids > 0 and enrichment_received_ids == 0:
+                    enrichment_errors.append("enrichment: empty details response")
+                elif enrichment_missing_ids > 0:
+                    enrichment_errors.append("enrichment: partial details response")
 
             for result in properties_list:
-                specific_details_for_property = extra_property_details.get(result["property_id"], {})
+                property_id = result.get("property_id")
+                if not property_id or (isinstance(property_id, str) and not property_id.strip()):
+                    continue
+                specific_details_for_property = extra_property_details.get(property_id, {})
+                if not specific_details_for_property:
+                    continue
 
                 #: address is retrieved on both homes and search homes, so when merged, homes overrides,
                 # this gets the internal data we want and only updates that (migrate to a func if more fields)
@@ -520,6 +585,12 @@ class RealtorScraper(Scraper):
                     del specific_details_for_property["location"]
 
                 result.update(specific_details_for_property)
+        else:
+            enrichment_requested_ids = 0
+            enrichment_received_ids = 0
+            enrichment_missing_ids = 0
+            enrichment_unaddressable_rows = 0
+            enrichment_errors = []
 
         if self.return_type != ReturnType.raw:
             with ThreadPoolExecutor(max_workers=self.NUM_PROPERTY_WORKERS) as executor:
@@ -540,18 +611,41 @@ class RealtorScraper(Scraper):
                 # Sort by index and extract properties in correct order
                 results.sort(key=lambda x: x[0])
                 properties = [result for idx, result in results]
+                processed_rows = len(properties)
+                processor_rejected_rows = len(properties_list) - processed_rows
         else:
             properties = properties_list
+            processed_rows = len(properties_list)
+            processor_rejected_rows = 0
 
         return {
             "total": total_properties,
             "properties": properties,
+            "raw_rows": raw_rows,
+            "window_rows": len(properties_list),
+            "processed_rows": processed_rows,
+            "processor_rejected_rows": processor_rejected_rows,
+            "offset": page_offset,
+            "requested_limit": page_window_size,
+            "completed": True,
+            "error": None,
+            "enrichment_requested_ids": enrichment_requested_ids,
+            "enrichment_received_ids": enrichment_received_ids,
+            "enrichment_missing_ids": enrichment_missing_ids,
+            "enrichment_unaddressable_rows": enrichment_unaddressable_rows,
+            "enrichment_errors": enrichment_errors,
         }
 
     def search(self):
         location_info = self.handle_location()
         if not location_info:
-            return []
+            metadata = SearchMetadata(
+                requested_limit=self.limit,
+                requested_offset=self.offset,
+                completeness_proven=False,
+                errors=["Location could not be resolved"],
+            )
+            return self._search_result([], metadata)
 
         location_type = location_info["area_type"]
 
@@ -567,11 +661,40 @@ class RealtorScraper(Scraper):
         if location_type == "address":
             if not self.radius:  #: single address search, non comps
                 property_id = location_info["mpr_id"]
-                return self.handle_home(property_id)
+                homes = self.handle_home(property_id)
+                total = 1 if homes else 0
+                raw_rows = len(homes)
+                metadata = SearchMetadata(
+                    source_reported_total=total,
+                    requested_limit=self.limit,
+                    requested_offset=self.offset,
+                    raw_rows_received=raw_rows,
+                    window_rows_received=raw_rows,
+                    processed_rows_received=raw_rows,
+                    processor_rejected_rows=0,
+                    returned_rows=raw_rows,
+                    page_offsets_attempted=[0],
+                    page_offsets_completed=[0] if homes else [],
+                    page_offsets_failed=[] if homes else [0],
+                    base_completeness_proven=bool(homes) and len(homes) == 1,
+                    full_base_result_set_completeness_proven=bool(homes) and len(homes) == 1,
+                    enrichment_requested=False,
+                    enrichment_completeness_proven=True,
+                    completeness_proven=bool(homes) and len(homes) == 1,
+                    full_result_set_completeness_proven=bool(homes) and len(homes) == 1,
+                    errors=[] if homes else ["Single address search returned no home"],
+                )
+                return self._search_result(homes, metadata)
 
             else:  #: general search, comps (radius)
                 if not location_info.get("centroid"):
-                    return []
+                    metadata = SearchMetadata(
+                        requested_limit=self.limit,
+                        requested_offset=self.offset,
+                        completeness_proven=False,
+                        errors=["No centroid for address radius search"],
+                    )
+                    return self._search_result([], metadata)
 
                 centroid = location_info["centroid"]
                 coordinates = [centroid["lon"], centroid["lat"]]  # GeoJSON order: [lon, lat]
@@ -588,7 +711,11 @@ class RealtorScraper(Scraper):
         if self.foreclosure:
             search_variables["foreclosure"] = self.foreclosure
 
-        result = self.general_search(search_variables, search_type=search_type)
+        try:
+            result = self.general_search(search_variables, search_type=search_type)
+        except Exception as exc:
+            result = self._failed_page(self.offset, exc)
+        page_results = [result]
         total = result["total"]
         homes = result["properties"]
 
@@ -596,7 +723,7 @@ class RealtorScraper(Scraper):
         if self.offset + self.DEFAULT_PAGE_SIZE < min(total, self.offset + self.limit):
             if self.parallel:
                 # Parallel mode: Fetch all remaining pages in parallel
-                with ThreadPoolExecutor() as executor:
+                with ThreadPoolExecutor(max_workers=self.SEARCH_PAGE_WORKERS) as executor:
                     futures_with_offsets = [
                         (i, executor.submit(
                             self.general_search,
@@ -610,14 +737,19 @@ class RealtorScraper(Scraper):
                         )
                     ]
 
-                    # Collect results and sort by offset to preserve API sort order
+                    # Collect results, capture exceptions, and sort by offset to preserve order
                     results = []
                     for offset, future in futures_with_offsets:
-                        results.append((offset, future.result()["properties"]))
+                        try:
+                            page_result = future.result()
+                        except Exception as exc:
+                            page_result = self._failed_page(offset, exc)
+                        results.append((offset, page_result))
 
                     results.sort(key=lambda x: x[0])
-                    for offset, properties in results:
-                        homes.extend(properties)
+                    for offset, page_result in results:
+                        page_results.append(page_result)
+                        homes.extend(page_result["properties"])
             else:
                 # Sequential mode: Fetch pages one by one with early termination checks
                 for current_offset in range(
@@ -629,12 +761,15 @@ class RealtorScraper(Scraper):
                     if not self._should_fetch_more_pages(homes):
                         break
 
-                    result = self.general_search(
-                        variables=search_variables | {"offset": current_offset},
-                        search_type=search_type,
-                    )
-                    page_properties = result["properties"]
-                    homes.extend(page_properties)
+                    try:
+                        page_result = self.general_search(
+                            variables=search_variables | {"offset": current_offset},
+                            search_type=search_type,
+                        )
+                    except Exception as exc:
+                        page_result = self._failed_page(current_offset, exc)
+                    page_results.append(page_result)
+                    homes.extend(page_result["properties"])
 
         # Apply client-side hour-based filtering if needed
         # (API only supports day-level filtering, so we post-filter for hour precision)
@@ -660,7 +795,186 @@ class RealtorScraper(Scraper):
         if self.return_type == ReturnType.raw:
             homes = self._apply_raw_data_filters(homes)
 
-        return homes
+        metadata = self._build_search_metadata(page_results, len(homes))
+        return self._search_result(homes, metadata)
+
+    def _failed_page(self, offset: int, error: Exception) -> dict:
+        """Build a failed page result so exceptions become deterministic metadata."""
+        page_window_size = max(0, min(self.DEFAULT_PAGE_SIZE, self.offset + self.limit - offset))
+        return {
+            "total": 0,
+            "properties": [],
+            "raw_rows": 0,
+            "window_rows": 0,
+            "processed_rows": 0,
+            "processor_rejected_rows": 0,
+            "offset": offset,
+            "requested_limit": page_window_size,
+            "completed": False,
+            "error": f"{type(error).__name__}: page request failed",
+            "enrichment_requested_ids": 0,
+            "enrichment_received_ids": 0,
+            "enrichment_missing_ids": 0,
+            "enrichment_unaddressable_rows": 0,
+            "enrichment_errors": [],
+        }
+
+    def _build_search_metadata(self, page_results: list[dict], returned_rows: int) -> SearchMetadata:
+        """Aggregate per-page results into a single SearchMetadata object."""
+        attempted: list[int] = []
+        completed: list[int] = []
+        failed: list[int] = []
+        raw_rows_received = 0
+        window_rows_received = 0
+        processed_rows_received = 0
+        processor_rejected_rows = 0
+        errors: list[str] = []
+        enrichment_requested_ids = 0
+        enrichment_received_ids = 0
+        enrichment_missing_ids = 0
+        enrichment_unaddressable_rows = 0
+        enrichment_errors: list[str] = []
+        source_reported_total: int | None = None
+        observed_totals: list[tuple[int, int]] = []
+        enrichment_requested = bool(self.extra_property_data)
+
+        for page in page_results:
+            offset = page.get("offset", 0)
+            attempted.append(offset)
+            if page.get("completed"):
+                completed.append(offset)
+                raw_rows_received += page.get("raw_rows", 0)
+                window_rows_received += page.get("window_rows", 0)
+                processed_rows_received += page.get("processed_rows", 0)
+                processor_rejected_rows += page.get("processor_rejected_rows", 0)
+                enrichment_requested_ids += page.get("enrichment_requested_ids", 0)
+                enrichment_received_ids += page.get("enrichment_received_ids", 0)
+                enrichment_missing_ids += page.get("enrichment_missing_ids", 0)
+                enrichment_unaddressable_rows += page.get("enrichment_unaddressable_rows", 0)
+                for err in page.get("enrichment_errors", []):
+                    if err not in enrichment_errors:
+                        enrichment_errors.append(err)
+                page_total = page.get("total")
+                if page_total is not None:
+                    observed_totals.append((offset, page_total))
+                    if source_reported_total is None:
+                        source_reported_total = page_total
+            else:
+                failed.append(offset)
+                err = page.get("error")
+                if err:
+                    errors.append(f"offset {offset}: {err}")
+
+        if observed_totals:
+            first_total = observed_totals[0][1]
+            for offset, page_total in observed_totals[1:]:
+                if page_total != first_total:
+                    errors.append(
+                        f"offset {offset}: inconsistent source total {page_total} "
+                        f"(first page reported {first_total})"
+                    )
+
+        requested_offset = self.offset
+        requested_limit = self.limit
+
+        # Cap/truncation decisions must be based on window rows (the raw source
+        # rows inside the caller's requested window), not on transport overfetch.
+        # A 9,900-row window whose source total is 9,900 may receive 10,000
+        # transport rows; that is complete, not capped.
+        reached_10k_boundary = (
+            requested_offset + requested_limit >= REALTOR_MAX_RESULTS
+            or (source_reported_total is not None and source_reported_total >= REALTOR_MAX_RESULTS)
+            or window_rows_received >= REALTOR_MAX_RESULTS
+            or any(o >= REALTOR_MAX_RESULTS for o in attempted)
+        )
+
+        truncated_by_10k = (
+            window_rows_received >= REALTOR_MAX_RESULTS
+            or (source_reported_total is not None and source_reported_total >= REALTOR_MAX_RESULTS)
+            or (
+                requested_offset + requested_limit >= REALTOR_MAX_RESULTS
+                and (source_reported_total is None or source_reported_total > requested_offset + requested_limit)
+            )
+        )
+
+        expected_rows: int | None = None
+        expected_offsets: list[int] = []
+        if source_reported_total is not None:
+            expected_rows = max(0, min(source_reported_total - requested_offset, requested_limit))
+            expected_offsets = [
+                o
+                for o in range(requested_offset, requested_offset + requested_limit, self.DEFAULT_PAGE_SIZE)
+                if o < source_reported_total
+            ]
+
+        all_expected_offsets_attempted = all(o in attempted for o in expected_offsets)
+
+        # Base listing-set completeness ignores optional enrichment failures.
+        base_completeness_proven = (
+            not truncated_by_10k
+            and not errors
+            and not failed
+            and expected_rows is not None
+            and window_rows_received == expected_rows
+            and all_expected_offsets_attempted
+            and processor_rejected_rows == 0
+        )
+        full_base_result_set_completeness_proven = (
+            base_completeness_proven
+            and requested_offset == 0
+            and source_reported_total is not None
+            and requested_limit >= source_reported_total
+            and returned_rows == source_reported_total
+        )
+
+        if enrichment_requested:
+            enrichment_completeness_proven = (
+                enrichment_unaddressable_rows == 0
+                and enrichment_missing_ids == 0
+                and not enrichment_errors
+                and enrichment_received_ids == enrichment_requested_ids
+            )
+        else:
+            enrichment_completeness_proven = True
+
+        completeness_proven = base_completeness_proven and enrichment_completeness_proven
+        full_result_set_completeness_proven = (
+            full_base_result_set_completeness_proven and enrichment_completeness_proven
+        )
+
+        return SearchMetadata(
+            source_reported_total=source_reported_total,
+            requested_limit=requested_limit,
+            requested_offset=requested_offset,
+            raw_rows_received=raw_rows_received,
+            window_rows_received=window_rows_received,
+            processed_rows_received=processed_rows_received,
+            processor_rejected_rows=processor_rejected_rows,
+            returned_rows=returned_rows,
+            page_offsets_attempted=attempted,
+            page_offsets_completed=completed,
+            page_offsets_failed=failed,
+            reached_10k_boundary=reached_10k_boundary,
+            truncated_by_10k=truncated_by_10k,
+            base_completeness_proven=base_completeness_proven,
+            full_base_result_set_completeness_proven=full_base_result_set_completeness_proven,
+            enrichment_requested=enrichment_requested,
+            enrichment_requested_ids=enrichment_requested_ids,
+            enrichment_received_ids=enrichment_received_ids,
+            enrichment_missing_ids=enrichment_missing_ids,
+            enrichment_unaddressable_rows=enrichment_unaddressable_rows,
+            enrichment_completeness_proven=enrichment_completeness_proven,
+            enrichment_errors=enrichment_errors,
+            completeness_proven=completeness_proven,
+            full_result_set_completeness_proven=full_result_set_completeness_proven,
+            errors=errors,
+        )
+
+    def _search_result(self, properties, metadata):
+        """Return either the raw list or a SearchResult wrapper depending on the caller's opt-in."""
+        if self.return_metadata:
+            return SearchResult(properties=properties, metadata=metadata)
+        return properties
 
     def _apply_hour_based_date_filter(self, homes):
         """Apply client-side hour-based date filtering for all listing types.
@@ -1138,5 +1452,4 @@ class RealtorScraper(Scraper):
 
         properties = data["data"]
         return {key.replace('home_', ''): properties[key] for key in properties if properties[key]}
-
 

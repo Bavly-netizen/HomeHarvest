@@ -239,7 +239,7 @@ Optional
 │
 ├── proxy (string): In format 'http://user:pass@host:port'
 │
-├── extra_property_data (True/False): Increases requests by O(n). If set, this fetches additional property data for general searches (e.g. schools, tax appraisals etc.)
+├── extra_property_data (True/False): Increases requests by O(n). When True, fetches additional property data for general searches (e.g. schools, tax appraisals) via per-page bulk detail requests. Defaults to False (no extra detail requests). Older public docs listed True as the default, but callers must opt in explicitly; RET can pass True to enable enrichment.
 │
 ├── exclude_pending (True/False): If set, excludes 'pending' properties from the 'for_sale' results unless listing_type is 'pending'
 │
@@ -248,6 +248,8 @@ Optional
 ├── offset (integer): Starting position for pagination within the 10k limit. Use with limit to fetch results in chunks.
 │
 └── parallel (True/False): Controls pagination strategy. Default is True (fetch pages in parallel for speed). Set to False for sequential fetching with early termination (useful for rate limiting or narrow time windows).
+│
+└── return_metadata (True/False): If True, returns a SearchResult wrapper containing the normal result plus a SearchMetadata object describing source-reported total, raw rows, page offsets, and whether the 10,000 upstream boundary was reached. Default is False (backwards-compatible behavior).
 ```
 
 ### Property Schema
@@ -345,6 +347,94 @@ Property
 │ └── estimates  # Historical estimates
 
 * Only available when using return_type='pydantic'
+```
+
+### Search Completeness Metadata (opt-in)
+
+HomeHarvest can return structured metadata that lets callers prove whether a search was complete. The 10,000 result limit is an upstream Realtor.com ceiling; the library does not remove it, but it now exposes the signals needed to decide whether a query must be split or sharded.
+
+```py
+from homeharvest import scrape_property, query_needs_split
+
+result = scrape_property(
+    location="San Diego, CA",
+    listing_type="sold",
+    past_days=30,
+    return_metadata=True,
+)
+
+print(result.properties)  # same pandas/pydantic/raw result as before
+print(result.metadata)
+```
+
+`SearchMetadata` contains:
+
+```plaintext
+SearchMetadata
+├── source (str): Always "realtor.com" for this scraper.
+├── source_reported_total (int | None): Total reported by the first API response.
+├── requested_limit (int): The limit that was requested.
+├── requested_offset (int): The offset that was requested.
+├── raw_rows_received (int): Source rows received from the API before any client-side filtering/processing, including final-page overfetch.
+├── window_rows_received (int): Source rows inside the caller's requested window before Pydantic processing or client filters.
+├── processed_rows_received (int): Window rows that passed HomeHarvest processing and were returned (or kept for raw return_type).
+├── processor_rejected_rows (int): Window rows that failed HomeHarvest processing and were dropped; these are not client-filter rejects.
+├── returned_rows (int): Rows after all client-side filtering/processing.
+├── page_offsets_attempted (list[int]): Every page offset that was requested.
+├── page_offsets_completed (list[int]): Page offsets that returned successfully.
+├── page_offsets_failed (list[int]): Page offsets that failed (e.g., bad API response).
+├── reached_10k_boundary (bool): Whether the requested window touched the 10,000 upstream limit.
+├── truncated_by_10k (bool): Whether the result may be capped by the 10,000 upstream limit.
+├── base_completeness_proven (bool): Whether the base listing search window is proven complete (ignores enrichment).
+├── full_base_result_set_completeness_proven (bool): Whether the full base listing snapshot is proven complete (ignores enrichment).
+├── enrichment_requested (bool): Whether optional extra-detail enrichment was requested.
+├── enrichment_requested_ids (int): Count of unique property IDs requested for enrichment (not raw IDs).
+├── enrichment_received_ids (int): Count of property IDs that received enrichment details.
+├── enrichment_missing_ids (int): Count of requested property IDs missing enrichment details.
+├── enrichment_unaddressable_rows (int): Base window rows that cannot be enriched because property_id is missing or blank; zero when enrichment was not requested.
+├── enrichment_completeness_proven (bool): Whether enrichment is complete; True when enrichment was not requested.
+├── enrichment_errors (list[str]): Safe fixed error categories for enrichment failures (no server/proxy text).
+├── completeness_proven (bool): Overall requested-window completeness (base complete and enrichment complete when requested).
+├── full_result_set_completeness_proven (bool): Overall full-snapshot completeness (base + enrichment when requested).
+├── errors (list[str]): Error messages from failed pages or inconsistent source totals.
+├── is_complete (bool): Convenience property for requested-window completeness.
+└── is_full_result_set_complete (bool): Convenience property for complete source-snapshot coverage.
+```
+
+For authoritative snapshot or stale-row workflows, use
+`full_result_set_completeness_proven` (overall) or
+`full_base_result_set_completeness_proven` (base listing set only). A request for
+5 rows from a 275-row source result can have a complete requested window while
+still being an incomplete source snapshot. When enrichment is requested,
+`base_completeness_proven` can remain true even if `completeness_proven` is false
+due to enrichment loss.
+
+A result is **not** marked complete when any of the following are true:
+
+- `window_rows_received >= 10_000` (the caller's window touches the upstream ceiling)
+- `source_reported_total >= 10_000`
+- `requested_offset + requested_limit >= 10_000` *and* more source rows are possible
+- any page offset failed
+- completed pages report inconsistent source totals
+- `processor_rejected_rows > 0` (HomeHarvest dropped records before returning them)
+- enrichment was requested but `enrichment_completeness_proven` is false (including when `enrichment_unaddressable_rows > 0`)
+
+`raw_rows_received` is transport evidence and may include final-page overfetch; cap
+decisions are made from `window_rows_received`, the source-reported total, and the
+requested boundary.
+
+For downstream consumers (e.g., RET), use the `query_needs_split` helper to decide whether a query must be subdivided. Recursive ZIP / price / date sharding belongs in the consumer, not inside this generic library.
+
+```py
+from homeharvest import query_needs_split
+
+must_split = query_needs_split(
+    offset=0,
+    limit=10_000,
+    source_reported_total=12_000,
+    raw_rows_received=10_000,
+    window_rows_received=10_000,
+)
 ```
 
 ### Exceptions
