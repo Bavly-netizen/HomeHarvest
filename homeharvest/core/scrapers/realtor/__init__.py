@@ -41,6 +41,7 @@ class RealtorScraper(Scraper):
     NUM_PROPERTY_WORKERS = 20
     SEARCH_PAGE_WORKERS = 8
     DEFAULT_PAGE_SIZE = 200
+    ENRICHMENT_BATCH_SIZE = 20
 
     def __init__(self, scraper_input):
         super().__init__(scraper_input)
@@ -554,20 +555,30 @@ class RealtorScraper(Scraper):
             if enrichment_unaddressable_rows > 0:
                 enrichment_errors.append("enrichment: rows missing property id")
 
-            try:
-                extra_property_details = self.get_bulk_prop_details(property_ids) or {}
-            except Exception:
-                enrichment_missing_ids = enrichment_requested_ids
-                enrichment_errors.append("enrichment: bulk details request failed")
-            else:
-                enrichment_received_ids = sum(
-                    1 for property_id in property_ids
-                    if extra_property_details.get(property_id)
-                )
-                enrichment_missing_ids = enrichment_requested_ids - enrichment_received_ids
-                if enrichment_requested_ids > 0 and enrichment_received_ids == 0:
+            batch_had_exception = False
+            for batch_start in range(0, len(property_ids), self.ENRICHMENT_BATCH_SIZE):
+                batch = property_ids[batch_start:batch_start + self.ENRICHMENT_BATCH_SIZE]
+                if not batch:
+                    continue
+                try:
+                    batch_details = self.get_bulk_prop_details(batch) or {}
+                except Exception:
+                    batch_had_exception = True
+                    if "enrichment: bulk details request failed" not in enrichment_errors:
+                        enrichment_errors.append("enrichment: bulk details request failed")
+                    continue
+                extra_property_details.update(batch_details)
+
+            enrichment_received_ids = sum(
+                1 for property_id in property_ids
+                if extra_property_details.get(property_id)
+            )
+            enrichment_missing_ids = enrichment_requested_ids - enrichment_received_ids
+            if enrichment_requested_ids > 0 and enrichment_received_ids == 0 and not batch_had_exception:
+                if "enrichment: empty details response" not in enrichment_errors:
                     enrichment_errors.append("enrichment: empty details response")
-                elif enrichment_missing_ids > 0:
+            elif enrichment_missing_ids > 0 and enrichment_received_ids > 0:
+                if "enrichment: partial details response" not in enrichment_errors:
                     enrichment_errors.append("enrichment: partial details response")
 
             for result in properties_list:

@@ -2684,6 +2684,175 @@ def test_metadata_enrichment_not_requested_zero_unaddressable_rows():
     assert result.metadata.completeness_proven is True
 
 
+def test_metadata_enrichment_chunked_full_success_45_ids():
+    """Forty-five unique IDs are enriched in three bounded batches (20/20/5)."""
+    with _mock_realtor_search(total=45):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=45,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 45
+    assert mock_bulk.call_count == 3
+    assert [len(call.args[0]) for call in mock_bulk.call_args_list] == [20, 20, 5]
+    assert all(len(call.args[0]) <= 20 for call in mock_bulk.call_args_list)
+    assert result.metadata.enrichment_requested_ids == 45
+    assert result.metadata.enrichment_received_ids == 45
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_completeness_proven is True
+    assert result.metadata.enrichment_errors == []
+    assert result.metadata.completeness_proven is True
+
+
+def test_metadata_enrichment_chunked_empty_middle_batch():
+    """An empty middle batch preserves first/last details with exact partial counts."""
+    call_index = {"n": 0}
+
+    def _bulk_with_empty_middle(property_ids):
+        call_index["n"] += 1
+        if call_index["n"] == 2:
+            return {}
+        return _mock_bulk_details_for_ids(property_ids)
+
+    with _mock_realtor_search(total=45):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=_bulk_with_empty_middle,
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=45,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 45
+    assert mock_bulk.call_count == 3
+    assert [len(call.args[0]) for call in mock_bulk.call_args_list] == [20, 20, 5]
+    assert result.metadata.enrichment_requested_ids == 45
+    assert result.metadata.enrichment_received_ids == 25
+    assert result.metadata.enrichment_missing_ids == 20
+    assert result.metadata.enrichment_completeness_proven is False
+    assert result.metadata.enrichment_errors == ["enrichment: partial details response"]
+    assert result.metadata.base_completeness_proven is True
+    assert result.metadata.completeness_proven is False
+    enriched_rows = [
+        row for row in result.properties
+        if row.get("tax_history")
+    ]
+    assert len(enriched_rows) == 25
+
+
+def test_metadata_enrichment_chunked_exception_middle_batch():
+    """An exception in a middle batch preserves other batches with safe errors."""
+    call_index = {"n": 0}
+
+    def _bulk_with_exception_middle(property_ids):
+        call_index["n"] += 1
+        if call_index["n"] == 2:
+            raise RuntimeError("proxy http://secret:credential@proxy.example.com leaked")
+        return _mock_bulk_details_for_ids(property_ids)
+
+    with _mock_realtor_search(total=45):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=_bulk_with_exception_middle,
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=45,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 45
+    assert mock_bulk.call_count == 3
+    assert result.metadata.enrichment_requested_ids == 45
+    assert result.metadata.enrichment_received_ids == 25
+    assert result.metadata.enrichment_missing_ids == 20
+    assert result.metadata.enrichment_completeness_proven is False
+    assert "enrichment: bulk details request failed" in result.metadata.enrichment_errors
+    assert "enrichment: partial details response" in result.metadata.enrichment_errors
+    assert all("secret" not in err for err in result.metadata.enrichment_errors)
+    assert all("credential" not in err for err in result.metadata.enrichment_errors)
+    assert all("proxy" not in err for err in result.metadata.enrichment_errors)
+    assert all("http://" not in err for err in result.metadata.enrichment_errors)
+    enriched_rows = [
+        row for row in result.properties
+        if row.get("tax_history")
+    ]
+    assert len(enriched_rows) == 25
+
+
+def test_metadata_enrichment_chunked_duplicate_ids_not_double_counted():
+    """Duplicate IDs across rows are enriched once and counted once across batches."""
+    side_effect = _graphql_search_with_duplicate_property_ids(total=25)
+    with _mock_realtor_search(total=25, side_effect=side_effect):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ) as mock_bulk:
+            result = scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=25,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert isinstance(result, SearchResult)
+    assert len(result.properties) == 25
+    all_batch_ids = [pid for call in mock_bulk.call_args_list for pid in call.args[0]]
+    assert len(all_batch_ids) == 24
+    assert len(set(all_batch_ids)) == 24
+    assert all(len(call.args[0]) <= 20 for call in mock_bulk.call_args_list)
+    assert result.metadata.enrichment_requested_ids == 24
+    assert result.metadata.enrichment_received_ids == 24
+    assert result.metadata.enrichment_missing_ids == 0
+    assert result.metadata.enrichment_completeness_proven is True
+
+
+def test_metadata_enrichment_chunked_every_call_bounded():
+    """Every bulk detail call stays within ENRICHMENT_BATCH_SIZE."""
+    from homeharvest.core.scrapers.realtor import RealtorScraper
+
+    with _mock_realtor_search(total=45):
+        with patch(
+            "homeharvest.core.scrapers.realtor.RealtorScraper.get_bulk_prop_details",
+            side_effect=lambda ids: _mock_bulk_details_for_ids(ids),
+        ) as mock_bulk:
+            scrape_property(
+                "Mock City, CA",
+                listing_type="for_sale",
+                limit=45,
+                extra_property_data=True,
+                return_metadata=True,
+                return_type="raw",
+            )
+
+    assert mock_bulk.call_count >= 1
+    assert all(
+        len(call.args[0]) <= RealtorScraper.ENRICHMENT_BATCH_SIZE
+        for call in mock_bulk.call_args_list
+    )
+
+
 def test_metadata_search_pagination_uses_bounded_workers():
     """Parallel pagination uses a bounded ThreadPoolExecutor worker count."""
     with _mock_realtor_search(total=400):

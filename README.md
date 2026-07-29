@@ -239,7 +239,7 @@ Optional
 │
 ├── proxy (string): In format 'http://user:pass@host:port'
 │
-├── extra_property_data (True/False): Increases requests by O(n). When True, fetches additional property data for general searches (e.g. schools, tax appraisals) via per-page bulk detail requests. Defaults to False (no extra detail requests). Older public docs listed True as the default, but callers must opt in explicitly; RET can pass True to enable enrichment.
+├── extra_property_data (True/False): Increases requests by O(n). When True, fetches additional property data for general searches (e.g. schools, tax appraisals) via per-page bulk detail requests in bounded batches of up to 20 unique property IDs per GraphQL call. Defaults to False (no extra detail requests). Older public docs listed True as the default, but callers must opt in explicitly; RET can pass True to enable enrichment.
 │
 ├── exclude_pending (True/False): If set, excludes 'pending' properties from the 'for_sale' results unless listing_type is 'pending'
 │
