@@ -8,6 +8,7 @@ This module implements the scraper for realtor.com
 from __future__ import annotations
 
 import json
+import re
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
@@ -118,7 +119,27 @@ class RealtorScraper(Scraper):
                     raise Exception(f"Transient API error: {error_msgs}")
             return None
 
-        geo_result = response_json["data"]["search_suggestions"]["geo_results"][0]
+        geo_results = response_json["data"]["search_suggestions"]["geo_results"]
+        requested_postal_match = re.fullmatch(
+            r"(\d{5})(?:-\d{4})?",
+            str(self.location or "").strip(),
+        )
+        if requested_postal_match:
+            requested_postal = requested_postal_match.group(1)
+            geo_result = next(
+                (
+                    item
+                    for item in geo_results
+                    if str((item.get("geo") or {}).get("area_type") or "") == "postal_code"
+                    and str((item.get("geo") or {}).get("postal_code") or "")[:5]
+                    == requested_postal
+                ),
+                None,
+            )
+            if geo_result is None:
+                return None
+        else:
+            geo_result = geo_results[0]
         geo = geo_result.get("geo", {})
 
         result = {
@@ -440,12 +461,14 @@ class RealtorScraper(Scraper):
         elif search_type == "area":  #: general search, came from a general location
             query = """query GetHomeSearch(
                                 $search_location: SearchLocation,
+                                $postal_code: String,
                                 $offset: Int
                             ) {
                                 homeSearch: home_search(
                                     query: {
                                         %s
                                         search_location: $search_location
+                                        postal_code: $postal_code
                                         %s
                                         %s
                                         %s
@@ -715,9 +738,28 @@ class RealtorScraper(Scraper):
                 }
 
         else:  #: general search (city, county, postal_code, etc.)
-            search_variables |= {
-                "search_location": {"location": location_info.get("text")},
-            }
+            if location_type == "postal_code":
+                postal_code = str(location_info.get("postal_code") or "").strip()[:5]
+                requested_postal_match = re.fullmatch(
+                    r"(\d{5})(?:-\d{4})?",
+                    str(self.location or "").strip(),
+                )
+                if (
+                    not requested_postal_match
+                    or postal_code != requested_postal_match.group(1)
+                ):
+                    metadata = SearchMetadata(
+                        requested_limit=self.limit,
+                        requested_offset=self.offset,
+                        completeness_proven=False,
+                        errors=["Postal location did not resolve exactly"],
+                    )
+                    return self._search_result([], metadata)
+                search_variables["postal_code"] = postal_code
+            else:
+                search_variables["search_location"] = {
+                    "location": location_info.get("text")
+                }
 
         if self.foreclosure:
             search_variables["foreclosure"] = self.foreclosure
@@ -1463,4 +1505,3 @@ class RealtorScraper(Scraper):
 
         properties = data["data"]
         return {key.replace('home_', ''): properties[key] for key in properties if properties[key]}
-

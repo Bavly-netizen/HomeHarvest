@@ -1759,6 +1759,100 @@ def _mock_realtor_search(total, results_per_page=200, side_effect=None):
 # --- Deterministic metadata / completeness tests ---
 
 
+def test_postal_search_selects_exact_suggestion_and_uses_exact_filter():
+    captured = {}
+
+    def _side_effect(query, variables, operation_name):
+        if operation_name == "Search_suggestions":
+            return {
+                "data": {
+                    "search_suggestions": {
+                        "geo_results": [
+                            {
+                                "text": "Charlotte, NC",
+                                "geo": {
+                                    "area_type": "city",
+                                    "city": "Charlotte",
+                                    "state_code": "NC",
+                                    "postal_code": None,
+                                },
+                            },
+                            {
+                                "text": "28277, Charlotte, NC",
+                                "geo": {
+                                    "area_type": "postal_code",
+                                    "city": "Charlotte",
+                                    "state_code": "NC",
+                                    "postal_code": "28277",
+                                },
+                            },
+                        ]
+                    }
+                }
+            }
+        if operation_name == "GetHomeSearch":
+            captured["query"] = query
+            captured["variables"] = variables
+            return _make_home_search_response([], 0)
+        raise AssertionError(f"unexpected operation {operation_name}")
+
+    with patch(
+        "homeharvest.core.scrapers.realtor.RealtorScraper._graphql_post",
+        side_effect=_side_effect,
+    ):
+        result = scrape_property(
+            "28277",
+            listing_type="for_sale",
+            limit=1,
+            return_type="raw",
+            return_metadata=True,
+        )
+
+    assert isinstance(result, SearchResult)
+    assert captured["variables"]["postal_code"] == "28277"
+    assert "search_location" not in captured["variables"]
+    assert "postal_code: $postal_code" in captured["query"]
+
+
+def test_postal_search_fails_closed_without_exact_suggestion():
+    def _side_effect(query, variables, operation_name):
+        assert operation_name == "Search_suggestions"
+        return {
+            "data": {
+                "search_suggestions": {
+                    "geo_results": [
+                        {
+                            "text": "Charlotte, NC",
+                            "geo": {
+                                "area_type": "city",
+                                "city": "Charlotte",
+                                "state_code": "NC",
+                                "postal_code": None,
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+
+    with patch(
+        "homeharvest.core.scrapers.realtor.RealtorScraper._graphql_post",
+        side_effect=_side_effect,
+    ):
+        result = scrape_property(
+            "28277",
+            listing_type="for_sale",
+            limit=1,
+            return_type="raw",
+            return_metadata=True,
+        )
+
+    assert isinstance(result, SearchResult)
+    assert result.properties == []
+    assert result.metadata.completeness_proven is False
+    assert "Location could not be resolved" in result.metadata.errors
+
+
 def test_metadata_backwards_compatibility():
     """Default scrape_property callers receive the same pandas DataFrame as before."""
     with _mock_realtor_search(total=5):
