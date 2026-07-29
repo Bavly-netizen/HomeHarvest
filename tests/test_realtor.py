@@ -4,7 +4,9 @@ from unittest.mock import patch
 from contextlib import contextmanager
 
 from homeharvest import scrape_property, Property, SearchResult, query_needs_split
+from homeharvest.core.scrapers.realtor.processors import process_property
 import pandas as pd
+import json
 
 
 def test_realtor_pending_or_contingent():
@@ -1765,6 +1767,56 @@ def test_metadata_backwards_compatibility():
     assert isinstance(result, pd.DataFrame)
     assert len(result) == 5
     assert "property_id" in result.columns
+
+
+def test_property_preserves_unknown_nested_source_fields_in_json_dump():
+    """Typed construction must not discard new nested Realtor GraphQL fields."""
+    source = _mock_property(1)
+    source["future_graphql_field"] = {
+        "nested_value": {"keep": ["all", {"the": "things"}]},
+        "unknown_flag": True,
+    }
+    source["details"] = [{
+        "category": "interior",
+        "text": ["Open kitchen"],
+        "unmodeled_detail": {"confidence": 0.97},
+    }]
+
+    property_model = process_property(source)
+    dumped = property_model.model_dump(mode="json")
+
+    assert dumped["raw_data"]["future_graphql_field"] == source["future_graphql_field"]
+    assert dumped["raw_data"]["details"] == source["details"]
+    json.dumps(dumped["raw_data"])
+
+
+def test_property_preserves_enrichment_payload_and_redacts_sensitive_keys():
+    """Extra property details survive direct processing without copying secrets."""
+    source = _mock_property(2)
+    source["taxHistory"] = [{
+        "year": 2025,
+        "assessment": {"total": 250000, "unmodeled": {"source": "county"}},
+    }]
+    enrichment = {
+        "nearbySchools": {
+            "schools": [{"district": {"name": "Example District"}}],
+            "unmodeled_rank": {"score": 9},
+        },
+        "future_assessment": {"market": 300000},
+        "access_token": "must-not-be-copied",
+    }
+
+    property_model = process_property(
+        source,
+        extra_property_data=True,
+        process_extra_property_details_func=lambda _: enrichment,
+    )
+    dumped = property_model.model_dump(mode="json")
+
+    assert dumped["raw_data"]["taxHistory"][0]["assessment"]["unmodeled"] == {"source": "county"}
+    assert dumped["raw_data"]["_homeharvest_enrichment"]["future_assessment"] == {"market": 300000}
+    assert "access_token" not in dumped["raw_data"]["_homeharvest_enrichment"]
+    json.dumps(dumped["raw_data"])
 
 
 def test_metadata_total_propagation():

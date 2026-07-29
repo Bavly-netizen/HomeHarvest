@@ -2,8 +2,11 @@
 Processors for realtor.com property data processing
 """
 
-from datetime import datetime
-from typing import Optional
+from datetime import date, datetime, time
+from enum import Enum
+from math import isfinite
+from typing import Any, Mapping, Optional
+from decimal import Decimal
 from ..models import (
     Property,
     ListingType,
@@ -26,6 +29,69 @@ from .parsers import (
     calculate_days_on_mls,
     process_alt_photos
 )
+
+
+_SENSITIVE_SOURCE_KEY_PARTS = (
+    "access_token",
+    "api_key",
+    "authorization",
+    "cookie",
+    "password",
+    "refresh_token",
+    "secret",
+)
+
+
+def _is_sensitive_source_key(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    return any(part in normalized for part in _SENSITIVE_SOURCE_KEY_PARTS)
+
+
+def _json_safe_source(value: Any) -> Any:
+    """Return a deterministic JSON-safe copy of a Realtor source value.
+
+    GraphQL responses are normally already JSON, but keeping this boundary
+    explicit protects ``Property.model_dump(mode='json')`` if a caller passes
+    date-like or other Python values to ``process_property``. Request
+    credentials are never copied into the source sink if an upstream payload
+    contains a sensitive-looking key.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if isfinite(value) else None
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return _json_safe_source(value.value)
+    if isinstance(value, Mapping):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            key_string = str(key)
+            if _is_sensitive_source_key(key_string):
+                continue
+            safe[key_string] = _json_safe_source(item)
+        return safe
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe_source(item) for item in value]
+    return str(value)
+
+
+def _build_raw_source_payload(result: Mapping[str, Any], prop_details: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Preserve the source response and any separately-returned enrichment.
+
+    Search enrichment is merged into ``result`` by ``RealtorScraper``. The
+    explicit enrichment block also covers direct callers of ``process_property``
+    that provide a details processor without mutating the source mapping.
+    """
+    payload = _json_safe_source(result)
+    if not isinstance(payload, dict):
+        payload = {}
+    if prop_details:
+        payload["_homeharvest_enrichment"] = _json_safe_source(prop_details)
+    return payload
 
 
 def process_advertisers(advertisers: list[dict] | None) -> Advertisers | None:
@@ -163,6 +229,7 @@ def process_property(result: dict, mls_only: bool = False, extra_property_data: 
         estimates=parse_estimates(result.get("estimates")),
         photos=result.get("photos"),
         flags=result.get("flags"),
+        raw_data=_build_raw_source_payload(result, prop_details),
     )
 
     # Enhance date precision using last_status_change_date

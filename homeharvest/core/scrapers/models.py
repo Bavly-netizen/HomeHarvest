@@ -239,6 +239,15 @@ class Property(BaseModel):
     photos: list[dict] | None = None  # Keep as dict for photo structure
     flags: HomeFlags | None = Field(None, description="Home flags for Listing/Property")
 
+    # The Realtor GraphQL schema changes independently of this typed model.
+    # ``raw_data`` is populated by the Realtor processor with a JSON-safe copy
+    # of the source response so newly-added or nested fields are not silently
+    # discarded while the typed API remains backwards compatible.
+    raw_data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON-safe source payload, including fields not represented by the typed model",
+    )
+
 
 # Specialized models for GraphQL types
 
